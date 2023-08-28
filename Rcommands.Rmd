@@ -1,0 +1,670 @@
+---
+title: "scATAC-seq data analysis workflow"
+output: html_document
+date: "2023-08-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Processed dataset
+The final Seurat object resulting from the processing below can also be obtained from figshare (doi: 10.6084/m9.figshare.24040575).
+
+After saving the file on your PC, this object can be loaded as follows:
+
+```{r readRDS}
+pbmc <- readRDS("processed.rds")
+```
+
+If you use this object, you can skip many steps below (including pre-processing, normalization, linear and non-linear dimensionality reduction, clustering).
+
+
+## Load libraries
+We need Seurat, Signac and EnsDb.Mmusculus.v75 for the single-cell ATAC-seq data analysis. 
+Regarding Signac, refer to these URLs:
+- https://stuartlab.org/signac/
+- https://stuartlab.org/signac/articles/install.html
+- https://stuartlab.org/signac/articles/overview.html
+- https://stuartlab.org/signac/articles/pbmc_vignette.html
+- https://stuartlab.org/signac/articles/mouse_brain_vignette
+- https://stuartlab.org/signac/articles/motif_vignette
+
+We need JASPAR2020, TFBSTools, and BSgenome.Mmusculus.UCSC.mm10 for motif analysis.
+We need ggplot2 for making plots.
+
+
+```{r libraries}
+library(Signac)
+library(Seurat)
+library(EnsDb.Mmusculus.v75)
+
+library(JASPAR2020)
+library(TFBSTools)
+library(BSgenome.Mmusculus.UCSC.mm10)
+
+library(ggplot2)
+library(reshape2)
+```
+
+## Set color scale
+Set the color scale for plots (although this could be done using the Spectral palette as well...) and the colors of the cell clusters.
+
+```{r color}
+col.scale <- c('#5E4FA2', '#3F96B7', '#88CFA4', '#D7EF9B', '#FFFFBF', '#FDD380', '#F88D51', '#DC494C', '#9E0142')
+cell.type.colors <-cols <- c(
+  "#696969",     # C1, 
+  "grey",        # C2
+  "#414141",     # C3
+  "darkgrey",    # C4
+  "#e79478",     # C5
+  "#d4582f",     # C6
+  "#cc5b5b",     # C7
+  "darkorange",  # C8
+  "darkred",     # C9
+  "#22bd1c",     # C10
+  "#77bf75",     # C11
+  "#6bf765",     # C12
+  "#377d34",     # C13
+  "#51ba4d",     # C14
+  "#9c9cff",     # C15
+  "#5f5f96",     # C16
+  "#8282d1",     # C17
+  "grey90"       # C18 (minor clusters)
+)
+
+```
+
+
+## Pre-processing workflow
+
+```{r pre}
+# Read in the output of the 10X Genomics cellranger-atac software. 
+DATA_IN <- "outs/" # the dir containing the cellranger-atac output
+infile <- paste0(DATA_IN,"filtered_peak_bc_matrix.h5")
+counts <- Read10X_h5(filename = infile)
+dim(counts)
+
+# Remove "strange" chromosomes.
+counts.regions <- GRanges(rownames(counts))
+length(counts.regions)
+counts.regions.filtered <- keepStandardChromosomes(counts.regions, pruning.mode = "coarse")
+length(counts.regions.filtered)
+counts <- counts[as.character(counts.regions.filtered),]
+dim(counts)
+
+
+# Prepare meta data
+infile <- paste0(DATA_IN,"singlecell.csv")
+metadata <- read.csv(
+  file = infile,
+  header = TRUE,
+  row.names = 1
+)
+
+metadata$sample <- NA
+metadata$sample[grep(pattern="-1", x=rownames(metadata), value=FALSE)] <- "control"
+metadata$sample[grep(pattern="-2", x=rownames(metadata), value=FALSE)] <- "Nfkbiz_KO"
+metadata$sample[grep(pattern="-3", x=rownames(metadata), value=FALSE)] <- "DKO"
+metadata$sample[grep(pattern="-4", x=rownames(metadata), value=FALSE)] <- "TKO"
+metadata$sample <- factor(metadata$sample, 
+                          levels = c("control", "DKO","Nfkbiz_KO", "TKO"))
+
+# Read in fragment data
+infile <- paste0(DATA_IN,"fragments.tsv.gz")
+chrom_assay <- CreateChromatinAssay(
+  counts = counts,
+  sep = c(":", "-"),
+  genome = 'mm10',
+  fragments = infile,
+  min.cells = 10,
+  min.features = 200
+)
+
+# Prepare Seurat objects
+# although we are not looking at PBMCs, let's just keep calling this variable pbmc...
+pbmc <- CreateSeuratObject(
+  counts = chrom_assay,
+  assay = "peaks",
+  meta.data = metadata
+)
+pbmc
+```
+
+The above results in a Seurat object of about 42k cells and 195k genomic regions.
+
+Clean up some memory.
+```{r cleanup}
+rm(counts, chrom_assay, metadata, counts.regions, counts.regions.filtered)
+gc()
+```
+
+
+Next, add gene annotations to the Seurat object using the mouse genome. 
+```{r annotations}
+# extract gene annotations from EnsDb
+annotations <- GetGRangesFromEnsDb(ensdb = EnsDb.Mmusculus.v75)
+
+# change to UCSC style since the data was mapped to mm10
+# seqlevelsStyle(annotations) <- 'UCSC'
+# However, lately this gives the following error:
+# Error in function (type, msg, asError = TRUE)  : 
+#   Failed to connect to ftp.ncbi.nlm.nih.gov port 21 after 42248 ms: Timed out
+# So, instead:
+seqlevels(annotations) <- paste0('chr', seqlevels(annotations))
+genome(annotations) <- "mm10"
+
+# add the gene information to the object
+Annotation(pbmc) <- annotations
+```
+
+Might be good to clear up some memory.
+```{r cleanup}
+rm(annotations)
+gc()
+```
+
+## Compute QC Metrics
+
+```{r QC}
+# compute nucleosome signal score per cell
+pbmc <- NucleosomeSignal(object = pbmc)
+
+# compute TSS enrichment score per cell
+pbmc <- TSSEnrichment(object = pbmc, fast = FALSE)
+
+# add blacklist ratio and fraction of reads in peaks
+pbmc$pct_reads_in_peaks <- pbmc$peak_region_fragments / pbmc$passed_filters * 100
+pbmc$blacklist_ratio <- pbmc$blacklist_region_fragments / pbmc$peak_region_fragments
+
+pbmc$high.tss <- ifelse(pbmc$TSS.enrichment > 2, 'High', 'Low')
+TSSPlot(pbmc, group.by = 'high.tss') + NoLegend()
+
+pbmc$nucleosome_group <- ifelse(pbmc$nucleosome_signal > 4, 'NS > 4', 'NS < 4')
+FragmentHistogram(object = pbmc, group.by = 'nucleosome_group')
+
+VlnPlot(
+  object = pbmc,
+  features = c('pct_reads_in_peaks', 'peak_region_fragments',
+               'TSS.enrichment', 'blacklist_ratio', 'nucleosome_signal'),
+  pt.size = 0.1,
+  ncol = 5
+)
+
+VlnPlot(
+  object = pbmc,
+  features = c('pct_reads_in_peaks', 'peak_region_fragments',
+               'TSS.enrichment', 'blacklist_ratio', 'nucleosome_signal'),
+  pt.size = 0,
+  ncol = 5
+)
+
+VlnPlot(
+  object = pbmc,
+  features = c('pct_reads_in_peaks', 'peak_region_fragments',
+               'TSS.enrichment', 'blacklist_ratio', 'nucleosome_signal'),
+  pt.size = 0,
+  ncol = 5,
+  group.by = "sample"
+)
+
+
+# finally we remove cells that are outliers for these QC metrics.
+pbmc <- subset(
+  x = pbmc,
+  subset = peak_region_fragments > 3000 &
+    peak_region_fragments < 20000 &
+    pct_reads_in_peaks > 30 &          # 15 in the example vignette
+    nucleosome_signal < 4 &
+    TSS.enrichment > 2
+)
+pbmc
+```
+
+
+## Normalization and linear dimensional reduction
+```{r linear}
+pbmc <- RunTFIDF(pbmc)
+pbmc <- FindTopFeatures(pbmc, min.cutoff = 'q0')
+pbmc <- RunSVD(pbmc)
+
+DepthCor(pbmc)
+# here too, as in the example vignettes: strong correlation between the first LSI and total number of counts per cell
+```
+
+## Non-linear dimension reduction and clustering
+Note: excluding the first dimension (see comment at the end of the chunk above).
+
+```{r nonlinear}
+pbmc <- RunUMAP(object = pbmc, reduction = 'lsi', dims = 2:30)
+pbmc <- FindNeighbors(object = pbmc, reduction = 'lsi', dims = 2:30)
+pbmc <- FindClusters(object = pbmc, verbose = FALSE, algorithm = 3)
+```
+
+
+## Cluster annotation
+```{r annotation}
+manual_clusters <- rep(NA, length(pbmc$seurat_clusters))
+manual_clusters[pbmc$seurat_clusters ==  0] <- "C1"
+manual_clusters[pbmc$seurat_clusters ==  1] <- "C1"
+manual_clusters[pbmc$seurat_clusters ==  3] <- "C2"
+manual_clusters[pbmc$seurat_clusters == 12] <- "C3"
+manual_clusters[pbmc$seurat_clusters == 18] <- "C4"
+manual_clusters[pbmc$seurat_clusters ==  2] <- "C5"
+# erythrocyte-oriented progenitors
+manual_clusters[pbmc$seurat_clusters ==  9] <- "C6"
+manual_clusters[pbmc$seurat_clusters ==  6] <- "C7"
+manual_clusters[pbmc$seurat_clusters ==  4] <- "C8"
+manual_clusters[pbmc$seurat_clusters ==  7] <- "C8"
+manual_clusters[pbmc$seurat_clusters == 17] <- "C9"
+# myeloid-oriented progenitors
+manual_clusters[pbmc$seurat_clusters ==  8] <- "C10"
+manual_clusters[pbmc$seurat_clusters == 13] <- "C11"
+manual_clusters[pbmc$seurat_clusters == 10] <- "C12"
+manual_clusters[pbmc$seurat_clusters ==  5] <- "C13"
+manual_clusters[pbmc$seurat_clusters == 11] <- "C14"
+# remaining minor clusters
+manual_clusters[pbmc$seurat_clusters == 14] <- "C15"
+manual_clusters[pbmc$seurat_clusters == 15] <- "C16"
+manual_clusters[pbmc$seurat_clusters == 16] <- "C17"
+manual_clusters[pbmc$seurat_clusters == 19] <- "C18"
+manual_clusters[pbmc$seurat_clusters == 20] <- "C18"
+manual_clusters[pbmc$seurat_clusters == 21] <- "C18"
+
+
+pbmc$manual_clusters <- factor(manual_clusters, levels = c(
+  "C1",  "C2",  "C3",  "C4" , "C5",
+  "C6",  "C7",  "C8",  "C9" , 
+  "C10", "C11", "C12", "C13", "C14",
+  "C15", "C16", "C17", "C18"
+))
+table(pbmc$manual_clusters)
+
+# some plots for Figures 5B,D
+DimPlot(object = pbmc, group.by = "manual_clusters", label = FALSE, cols = cols)
+DimPlot(object = pbmc, group.by = "manual_clusters", label = TRUE, cols = cols) + NoLegend()
+DimPlot(object = pbmc, label = FALSE, split.by = "sample", group.by = "manual_clusters", cols = cols) + NoLegend()
+```
+
+## Create a gene activity matrix
+```{r genes}
+gene.activities <- GeneActivity(pbmc)
+# add the gene activity matrix to the Seurat object as a new assay and normalize it
+pbmc[['RNA']] <- CreateAssayObject(counts = gene.activities)
+pbmc <- NormalizeData(
+  object = pbmc,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(pbmc$nCount_RNA)
+)
+```
+
+## Adding motif information to the Seurat object
+```{r motifs}
+# Get a list of motif position frequency matrices from the JASPAR database
+pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+
+# add motif information
+DefaultAssay(pbmc) <- 'peaks' # if you don't do this, it will use 'RNA' leading to errors
+pbmc <- AddMotifs(
+  object = pbmc,
+  genome = BSgenome.Mmusculus.UCSC.mm10,
+  pfm = pfm
+)
+
+```
+
+
+## Save what we have at the moment
+```{r save}
+processed.file <- paste0("processed.rds")
+saveRDS(object = pbmc, file = processed.file)
+```
+The above processed.rds file can be found on figshare (doi: 10.6084/m9.figshare.24040575).
+
+
+## UMAP of selected genes
+Figures shown in Supplement for HSC, Myeloid, Meg/erythroid, and Lymphoid markers:
+```{r selection}
+genes <- c("Hlf",   "Meis1", "Mllt3",  "Pbx1",
+           "Spi1",  "Csf1r", "S100a8", "F13a1",
+           "Gata1", "Car1",  "Epor",   "Pf4",
+           "Satb1", "Flt3",  "Dntt",   "Id4")
+for(gene in genes){
+  p <- FeaturePlot(
+    object = pbmc,
+    features = gene,
+    pt.size = 0.1,
+    max.cutoff = 'q95',
+  ) + scale_colour_gradientn(colours = col.scale)
+  ggsave(plot=p, file="feature_plot_",gene,".pdf", width=6, height=6)
+}
+```
+
+
+## bar plot of cluster composition of each sample
+The barplot shown in Figure 5C:
+
+```{r barplot_samples}
+tab <- as.matrix(table(pbmc$manual_clusters, pbmc$sample))
+tab.col.tot <- apply(tab,2,sum)
+tab.freq <- tab
+for(c in 1:ncol(tab)){
+  tab.freq[,c] <- tab[,c] / tab.col.tot[c] * 100
+}
+# confirm that this sums to 100
+apply(tab.freq,2,sum)
+
+tab.long <- melt(tab.freq, varnames = c("cluster", "sample"))
+head(tab.long)
+
+ggplot(tab.long, aes(x=sample,y=value,fill=cluster)) +
+  geom_bar(position="stack", stat="identity") + theme_bw() +
+  scale_fill_manual("legend", values = cols) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank())
+
+```
+
+
+## bar plot of sample composition of each cluster
+The barplot at the bottom of Figure 5E:
+```{r barplot}
+tab <- as.matrix(table(pbmc$sample, pbmc$manual_clusters))
+tab.row.tot <- apply(tab,1,sum)
+tab.norm <- tab / tab.row.tot
+tab.col.tot <- apply(tab.norm,2,sum)
+tab.freq <- tab.norm
+for(c in 1:ncol(tab)){
+  tab.freq[,c] <- tab.norm[,c] / tab.col.tot[c] * 100
+}
+
+tab.long <- melt(tab.freq, varnames = c("sample", "cluster"))
+head(tab.long)
+tab.long$cluster <- factor(tab.long$cluster, levels=levels(pbmc$manual_clusters))
+# to exclude the smaller clusters
+tab.long <- subset(tab.long, !is.element(tab.long$cluster, c("C15","C16", "C17", "C18") ))
+ggplot(tab.long, aes(x=cluster,y=value,fill=sample)) +
+  geom_bar(position="stack", stat="identity") + theme_bw() +
+  scale_fill_manual("legend", values = c("control"   = "blue", 
+                                         "DKO"       = "red", 
+                                         "Nfkbiz_KO" = "#4eac5b", # green
+                                         "TKO"       = "#ff00ff") # pink
+                    ) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+## Heatmap of marker genes
+The heatmap of Figure 5E:
+
+```{r heatmapE}
+markers <- c("Gprc5c", "Egr1",   "Neo1",   "Igf2bp2", "Ptges",
+             "Mllt3",  "Msi2",   "Gata2",  "Hoxa9",   "Hoxa10",
+             "Hoxb5",  "Meis1",  "Itga2b", "Hlf",     "Ifitm1",
+             "Gstm1",  "Pbx1",   "Mn1",    "Lmo4",    "Cebpa",
+             "Cebpb",  "Cebpe",  "Spi1",   "Csf1r",   "Csf2ra",
+             "Csf2rb", "Csf3r",  "Fcer1g", "Cd52",    "F7",
+             "F13a1",  "Ly86",   "Mpo",    "Elane",   "Fcnb",
+             "Ltf",    "S100a8", "S100a9", "Cd74",    "Satb1",
+             "Notch1", "Flt3",   "Dntt",   "Id4",     "Cd28",
+             "Pf4",    "Gata1",   "Epor",  "Car1")
+# get average expression of markers per cluster
+averages <- AverageExpression(pbmc, assays = "RNA", group.by = "manual_clusters", features = markers)
+dim(averages$RNA)
+averages <- averages$RNA
+# exclude the minor clusters
+averages <- averages[, !is.element(colnames(averages), c("C15","C16","C17","C18"))]
+averages[1:5,]
+
+# scale
+averages.norm <- t(scale(t(averages)))
+# melt to long form
+dat.melt <- melt(averages.norm, varnames = c("feature", "cluster"))
+# to reverse the order in the heatmap
+dat.melt$feature <- factor(dat.melt$feature, 
+                             levels = rev(rownames(averages.norm)))
+ggplot(dat.melt, aes(x = cluster, y = feature, fill = value)) + 
+    geom_tile() + 
+    scale_fill_gradientn(colors = colorRampPalette(col.scale)(50)) + 
+    theme_bw() + theme(panel.grid.major = element_blank(),
+                       panel.grid.minor = element_blank()) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+
+## Smaller heatmap of marker genes
+The heatmap of Figure 5F:
+```{r heatmapF}
+markers <- c("Lmo4",  "Cebpa",  "Cebpb",  "Cebpe",  "Spi1",
+             "Csf1r", "Csf2ra", "Csf2rb", "Csf3r",  "Fcer1g",
+             "Cd52",  "F7",     "F13a1",  "Ly86",   "Mpo",
+             "Elane", "Fcnb",   "Ltf",    "S100a8", "S100a9", 
+             "Cd74")
+# focus on C1 to C8, and control and DKO only
+filter <- is.element(pbmc$manual_clusters, paste0("C", 1:8)) &
+          is.element(pbmc$sample, c("control", "DKO")) 
+pbmc.subset <- pbmc[, filter]
+
+# define super-clusters
+pbmc.subset$super <- rep(NA, length(pbmc.subset$manual_clusters))
+pbmc.subset$super[is.element(pbmc.subset$manual_clusters, paste0("C", 1:5))] <- "MPP"
+pbmc.subset$super[is.element(pbmc.subset$manual_clusters, paste0("C", 6:8))] <- "ery"
+
+# combine samples and super-clusters
+pbmc.subset$super_sample <- paste(pbmc.subset$super,pbmc.subset$sample, sep = "_")
+
+
+# get average expression of markers per sample in these clusters
+averages <- AverageExpression(pbmc.subset, assays = "RNA", group.by = "super_sample", features = markers)
+dim(averages$RNA)
+averages <- averages$RNA
+averages[1:5,]
+
+# scale
+averages.norm <- t(scale(t(averages)))
+# melt to long form
+dat.melt <- melt(averages.norm, varnames = c("feature", "cluster"))
+# to reverse the order in the heatmap
+dat.melt$feature <- factor(dat.melt$feature, 
+                             levels = rev(rownames(averages.norm)))
+ggplot(dat.melt, aes(x = cluster, y = feature, fill = value)) + 
+    geom_tile() + 
+    scale_fill_gradientn(colors = colorRampPalette(col.scale)(50)) + 
+    theme_bw() + theme(panel.grid.major = element_blank(),
+                       panel.grid.minor = element_blank()) +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+# clean up
+rm(pbmc.subset)
+gc()
+```
+
+## Marker genes for HSC, MPP2, MPP3, MPP4
+This is to reproduce the figures in supplementary material showing the signal of marker genes for HSC, MPP2, MPP2, and MPP4 cell types. See the hsc_markers.csv, mpp2_markers.csv, mpp3_markers.csv, and mpp4_markers.csv files in this repository.
+
+```{r otherMarkers}
+# read in the markers
+hsc.markers <- read.csv("hsc_markers.csv")[,2]
+mpp2.markers <- read.csv("mpp2_markers.csv")[,2]
+mpp3.markers <- read.csv("mpp3_markers.csv")[,2]
+mpp4.markers <- read.csv("mpp4_markers.csv")[,2]
+
+# calculate module scores
+DefaultAssay(pbmc) <- 'RNA'
+pbmc <- AddModuleScore(pbmc, features = list(hsc.markers), name = "hsc_")
+pbmc <- AddModuleScore(pbmc, features = list(mpp2.markers), name = "mpp2_")
+pbmc <- AddModuleScore(pbmc, features = list(mpp3.markers), name = "mpp3_")
+pbmc <- AddModuleScore(pbmc, features = list(mpp4.markers), name = "mpp4_")
+# keep in mind that AddModuleScore will append a "1" to the names...
+
+# UMAP plots
+FeaturePlot(pbmc, features = "hsc_1") + scale_colour_gradientn(colours = col.scale)
+FeaturePlot(pbmc, features = "mpp2_1") + scale_colour_gradientn(colours = col.scale)
+FeaturePlot(pbmc, features = "mpp3_1") + scale_colour_gradientn(colours = col.scale)
+FeaturePlot(pbmc, features = "mpp4_1") + scale_colour_gradientn(colours = col.scale)
+
+# violin plots
+VlnPlot(pbmc, features = "hsc_1", group.by="manual_clusters", pt.size=0, cols=cols) + 
+  theme( panel.grid.minor.y = element_line( size=.1, color="black" ),
+         panel.grid.major.y = element_line( size=.1, color="black" ) ) # horizontal grid lines
+
+VlnPlot(pbmc, features = "mpp2_1", group.by="manual_clusters", pt.size=0, cols=cols) + 
+  theme( panel.grid.minor.y = element_line( size=.1, color="black" ),
+         panel.grid.major.y = element_line( size=.1, color="black" ) ) # horizontal grid lines
+
+VlnPlot(pbmc, features = "mpp3_1", group.by="manual_clusters", pt.size=0, cols=cols) + 
+  theme( panel.grid.minor.y = element_line( size=.1, color="black" ),
+         panel.grid.major.y = element_line( size=.1, color="black" ) ) # horizontal grid lines
+
+VlnPlot(pbmc, features = "mpp4_1", group.by="manual_clusters", pt.size=0, cols=cols) + 
+  theme( panel.grid.minor.y = element_line( size=.1, color="black" ),
+         panel.grid.major.y = element_line( size=.1, color="black" ) ) # horizontal grid lines
+```
+
+
+## Prediction of DARs
+Prediction of differentially accessible regions (DARs) between control and DKO samples, and figures 5G and 5H.
+
+```{r DARs}
+# define super-clusters
+pbmc$super <- rep(NA, length(pbmc$manual_clusters))
+pbmc$super[is.element(pbmc$manual_clusters, paste0("C", 1:5))] <- "MPP"
+pbmc$super[is.element(pbmc$manual_clusters, paste0("C", 6:8))] <- "ery"
+
+DefaultAssay(pbmc) <- 'peaks'
+
+# in clusters C1 to C5 between control and DKO
+da_peaks_MPP_high_in_control <- FindMarkers(
+    object = subset(pbmc, super == "MPP"),
+    ident.1 = "control",
+    ident.2 = "DKO",
+    group.by = "sample",
+    min.pct = 0.1,
+    logfc.threshold = 0.1,
+    test.use = 'LR',
+    latent.vars = 'peak_region_fragments',
+    only.pos = TRUE
+  )
+da_peaks_MPP_high_in_DKO <- FindMarkers(
+    object = subset(pbmc, super == "MPP"),
+    ident.1 = "DKO",
+    ident.2 = "control",
+    group.by = "sample",
+    min.pct = 0.1,
+    logfc.threshold = 0.1,
+    test.use = 'LR',
+    latent.vars = 'peak_region_fragments',
+    only.pos = TRUE
+  )
+
+# in clusters C6 to C8 between control and DKO
+da_peaks_ery_high_in_control <- FindMarkers(
+    object = subset(pbmc, super == "ery"),
+    ident.1 = "control",
+    ident.2 = "DKO",
+    group.by = "sample",
+    min.pct = 0.1,
+    logfc.threshold = 0.1,
+    test.use = 'LR',
+    latent.vars = 'peak_region_fragments',
+    only.pos = TRUE
+  )
+da_peaks_ery_high_in_DKO <- FindMarkers(
+    object = subset(pbmc, super == "ery"),
+    ident.1 = "DKO",
+    ident.2 = "control",
+    group.by = "sample",
+    min.pct = 0.1,
+    logfc.threshold = 0.1,
+    test.use = 'LR',
+    latent.vars = 'peak_region_fragments',
+    only.pos = TRUE
+  )
+
+# choosing a set of background peaks
+open.peaks <- AccessiblePeaks(pbmc)
+
+# for each of the 4 sets of da_peaks, get enriched motifs
+# note that there is a certain amount of randomness (the control regions are picked randomly)
+dar_motif_prediction = function(da_peaks){
+  top.da.peak <- rownames(da_peaks[da_peaks$p_val_adj < 0.0001,])
+  message(length(top.da.peak))
+  
+  # match the overall GC content in the peak set using the open peaks set
+  meta.feature <- GetAssayData(pbmc, assay = "peaks", slot = "meta.features")
+  peaks.matched <- MatchRegionStats(
+    meta.feature = meta.feature[open.peaks, ],
+    query.feature = meta.feature[top.da.peak, ],
+    n = 50000
+  )
+  
+  # test enrichment
+  enriched.motifs <- FindMotifs(
+    object = pbmc,
+    features = top.da.peak,
+    background = peaks.matched
+  )
+}
+
+motifs_MPP_high_in_control <- dar_motif_prediction(da_peaks_MPP_high_in_control)
+# based on 238 DARs
+motifs_MPP_high_in_DKO     <- dar_motif_prediction(da_peaks_MPP_high_in_DKO)
+# based on 227 DARs
+motifs_ery_high_in_control <- dar_motif_prediction(da_peaks_ery_high_in_control)
+# based on 90 DARs
+motifs_ery_high_in_DKO     <- dar_motif_prediction(da_peaks_ery_high_in_DKO)
+# based on 246 DARs
+
+# function for making volcano plots from pairs of the above results
+make_volcano_2_sets = function(dat1, dat2, n1, n2, n3 = 50000){
+  
+  # put into the same order
+  dat2 <- dat2[rownames(dat1),]
+  
+  message("n1: ", n1, " - n2: ", n2)
+  # direct comparison set 1 vs set 2
+  res <- matrix(NA, nrow=nrow(dat1), ncol = 7)
+  rownames(res) <- rownames(dat1)
+  colnames(res) <- c("with1", "without1", "with2", "without2", "freq1", "freq2", "pvalue")
+  for(i in 1:nrow(dat1)){
+    # get entries for Fisher's exact test
+    entry1 <- dat1$observed[i]
+    entry2 <- n1 - dat1$observed[i]
+    entry3 <- dat2$observed[i]
+    entry4 <- n2 - dat2$observed[i]
+    m <- matrix(c(entry1, entry2, entry3, entry4), nrow=2)
+    res.fisher <- fisher.test(m)
+    pval <- res.fisher$p.value
+    res[i,] <- c(entry1, entry2, entry3, entry4, (entry1+1)/(n1+1), (entry3+1)/(n2+1), pval)
+  }
+  
+  df <- data.frame(
+    log2fold = log2(res[,"freq1"]/res[,"freq2"]),
+    log10pval = log10(res[,"pvalue"]),
+    name = dat1$motif.name
+  )
+  rownames(df) <- rownames(res)
+
+  p <- ggplot(df, aes(x=log2fold, y=log10pval)) +
+    geom_point() + scale_y_continuous(trans="reverse") + 
+    theme_bw()
+  
+  list(result = res,
+       volcano = p)
+}
+
+# for Figure 5G
+res.MPP <- make_volcano_2_sets(motifs_MPP_high_in_DKO, motifs_MPP_high_in_control, n1=227, n2=238)
+head(res.MPP$result)
+res.MPP$volcano
+
+# for Figure 5H
+res.ery <- make_volcano_2_sets(motifs_ery_high_in_DKO, motifs_ery_high_in_control, n1=246, n2=90)
+head(res.ery$result)
+res.ery$volcano
+
+```
+
